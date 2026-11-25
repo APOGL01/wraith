@@ -27,6 +27,10 @@ export interface OfframpReconciliationEvent {
  * Returns false when the network is invalid or the order is not ours. Nothing
  * here creates a row: an event for an order we never placed is not ours to act
  * on.
+ *
+ * Returns true without writing when the status and amounts are unchanged —
+ * idempotent so a wallet polling a finished order and a re-delivered webhook
+ * never re-fire money-failure counters or terminal metrics.
  */
 export async function reconcileOfframpOrder(
   event: OfframpReconciliationEvent,
@@ -41,6 +45,13 @@ export async function reconcileOfframpOrder(
 
   const status = event.status ?? event.event;
 
+  // Early-return when the status is unchanged: a wallet polling a finished
+  // order and a re-delivered webhook must not re-fire money-failure counters,
+  // terminal metrics, or issue unnecessary database writes.
+  // Amounts are only written on a settlement transition (see below), so they
+  // cannot change independently of a status change in normal operation.
+  if (status === existing.status) return true;
+
   // Counted here rather than in the webhook so the sweep counts it too: either
   // path may be the one that first sees the ending. Comparing the row we just
   // read against the incoming status is what keeps a redelivered webhook, and a
@@ -48,14 +59,21 @@ export async function reconcileOfframpOrder(
   const wasTerminal = terminalStatusOf(existing.status);
   const isTerminal = terminalStatusOf(status);
 
+  // Only write settled amounts on a settlement transition. Writing them on
+  // every status change (e.g. "processing") stores the in-flight amount as the
+  // settled figure, which is wrong for the settled/cache display path.
+  const isSettlement = isTerminal === "settled";
+
   await prisma.offrampOrder.update({
     where: { network_orderId: { network, orderId: event.orderId } },
     data: {
       status,
-      ...(event.amountStableCoin != null
+      ...(isSettlement && event.amountStableCoin != null
         ? { settledStableCoin: String(event.amountStableCoin) }
         : {}),
-      ...(event.amountNGN != null ? { settledNGN: String(event.amountNGN) } : {}),
+      ...(isSettlement && event.amountNGN != null
+        ? { settledNGN: String(event.amountNGN) }
+        : {}),
       ...(event.txHash ? { depositTxHash: event.txHash } : {}),
     },
   });
