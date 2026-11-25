@@ -3,6 +3,7 @@ import { createApp } from "../api";
 import {
   ledgersIndexedTotal,
   transfersStoredTotal,
+  eventsSkippedTotal,
   lastIndexedLedger,
   observeDbQuery,
   recordRpcError,
@@ -75,6 +76,8 @@ describe("Prometheus metrics (#39)", () => {
       ledgersIndexedTotal.inc({ network: "testnet" }, 12);
       transfersStoredTotal.inc({ network: "testnet", type: "fungible" }, 5);
       transfersStoredTotal.inc({ network: "testnet", type: "nft" }, 2);
+      transfersStoredTotal.inc({ network: "testnet", type: "lp" }, 3);
+      transfersStoredTotal.inc({ network: "testnet", type: "host_fn" }, 7);
       lastIndexedLedger.set({ network: "testnet" }, 987_654);
       recordRpcError("retry");
 
@@ -83,6 +86,8 @@ describe("Prometheus metrics (#39)", () => {
       expect(res.text).toContain('ledgers_indexed_total{network="testnet"} 12');
       expect(res.text).toContain('transfers_stored_total{network="testnet",type="fungible"} 5');
       expect(res.text).toContain('transfers_stored_total{network="testnet",type="nft"} 2');
+      expect(res.text).toContain('transfers_stored_total{network="testnet",type="lp"} 3');
+      expect(res.text).toContain('transfers_stored_total{network="testnet",type="host_fn"} 7');
       expect(res.text).toContain('last_indexed_ledger{network="testnet"} 987654');
       expect(res.text).toContain('rpc_errors_total{outcome="retry"} 1');
     });
@@ -156,6 +161,46 @@ describe("Prometheus metrics (#39)", () => {
         .filter((line) => line.startsWith("ledgers_skipped_total{"));
       expect(skipped).toHaveLength(2);
       expect(skipped.join("\n")).not.toMatch(/ledger=|contract=|address=|url=/);
+    });
+  });
+
+  describe("events_skipped_total (#445)", () => {
+    it("carries a network label so testnet and mainnet drops are separate series", async () => {
+      // The key assertion from the issue: a rising malformed count must be
+      // pinnable to a chain.  With one label per (network, reason) pair the
+      // scraper gets two series even if both networks see the same reason.
+      eventsSkippedTotal.inc({ network: "testnet", reason: "malformed" }, 3);
+      eventsSkippedTotal.inc({ network: "mainnet", reason: "malformed" }, 1);
+      eventsSkippedTotal.inc({ network: "testnet", reason: "unrecognised" }, 10);
+
+      const res = await request(app).get("/metrics");
+
+      expect(res.text).toContain('events_skipped_total{network="testnet",reason="malformed"} 3');
+      expect(res.text).toContain('events_skipped_total{network="mainnet",reason="malformed"} 1');
+      expect(res.text).toContain('events_skipped_total{network="testnet",reason="unrecognised"} 10');
+    });
+
+    it("counts nft_parse drops and host_fn drops separately from malformed fungible drops", async () => {
+      eventsSkippedTotal.inc({ network: "testnet", reason: "nft_parse" }, 2);
+      eventsSkippedTotal.inc({ network: "testnet", reason: "host_fn" }, 4);
+      eventsSkippedTotal.inc({ network: "testnet", reason: "malformed" }, 1);
+
+      const res = await request(app).get("/metrics");
+
+      expect(res.text).toContain('events_skipped_total{network="testnet",reason="nft_parse"} 2');
+      expect(res.text).toContain('events_skipped_total{network="testnet",reason="host_fn"} 4');
+      expect(res.text).toContain('events_skipped_total{network="testnet",reason="malformed"} 1');
+    });
+
+    it("label set carries no contract id, address or event id", async () => {
+      eventsSkippedTotal.inc({ network: "testnet", reason: "malformed" }, 1);
+
+      const lines = (await registry.metrics())
+        .split("\n")
+        .filter((line) => line.startsWith("events_skipped_total{"));
+
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).not.toMatch(/contract=|address=|event=|id=/);
     });
   });
 

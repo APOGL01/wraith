@@ -558,14 +558,24 @@ ledgers_indexed_total{network="mainnet"} 48213
 # HELP last_indexed_ledger Highest ledger sequence committed by the indexer, per network
 # TYPE last_indexed_ledger gauge
 last_indexed_ledger{network="mainnet"} 5842100
+# HELP transfers_stored_total Rows persisted by the indexer, per network and record type (fungible, nft, lp, host_fn)
+# TYPE transfers_stored_total counter
+transfers_stored_total{network="mainnet",type="fungible"} 182400
+transfers_stored_total{network="mainnet",type="nft"} 310
+transfers_stored_total{network="mainnet",type="lp"} 92
+transfers_stored_total{network="mainnet",type="host_fn"} 182802
+# HELP events_skipped_total Events dropped during ingest, by network and reason
+# TYPE events_skipped_total counter
+events_skipped_total{network="mainnet",reason="unrecognised"} 94100
+events_skipped_total{network="mainnet",reason="malformed"} 0
 ```
 
 | Metric | Type | Labels | What it says |
 | ------ | ---- | ------ | ------------ |
 | `ledgers_indexed_total` | counter | `network` | Ledgers the indexer has advanced through. A flat `rate()` on a network whose loop should be running means it has stalled. |
-| `transfers_stored_total` | counter | `network`, `type` | Rows persisted, split `fungible` / `nft` — one parse path can break while the other keeps working. |
+| `transfers_stored_total` | counter | `network`, `type` | Rows persisted, split `fungible` / `nft` / `lp` / `host_fn` — each comes off a distinct parse path and one can break while the others keep working. `host_fn` is the table that once grew to 1 776 MB; its write rate is the number an operator most needs to watch. |
 | `rpc_errors_total` | counter | `outcome` | Failed RPC attempts. `retry` counts attempts `withRetry` absorbed, `exhausted` counts calls that gave up — a degrading endpoint shows up in `retry` long before it fails a call. |
-| `events_skipped_total` | counter | `reason` | Events the decoder dropped. `unrecognised` is non-token events (normal); `malformed` is token events that failed to decode — a rising rate points at a non-standard contract or a decoder bug. |
+| `events_skipped_total` | counter | `network`, `reason` | Events dropped during ingest. `unrecognised` is non-token events (normal background noise); `malformed` is a fungible token event whose structure was invalid; `nft_parse` is an NFT event `parseNftTransferEvent` returned null for; `host_fn` is a host-function log event that threw during parse. All carry `network` so a rising count can be pinned to a chain in a process running multiple networks. |
 | `last_indexed_ledger` | gauge | `network` | Highest committed ledger. Against the chain tip, this is lag. |
 | `db_query_duration_seconds` | histogram | `operation` | Duration of instrumented DB operations, failures included. |
 | `http_requests_total` | counter | `method`, `route`, `status` | HTTP requests served. `route` is the Express route *pattern*, never the raw URL, so addresses never become label values; an unmatched request reports `route="unknown"`. |

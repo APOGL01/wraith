@@ -243,12 +243,21 @@ export const ledgersIndexedTotal = new Counter({
 /**
  * Rows written by the indexer, split by record type.
  *
- * `type` separates fungible transfers from NFT ones: they come off different
- * parse paths and one can break while the other keeps working.
+ * `type` separates fungible transfers, NFT transfers, liquidity-pool share
+ * records, and host-function log rows.  Each comes off a distinct parse path
+ * and one can break while the others keep working.  `host_fn` is the table
+ * that grew to 1 776 MB and filled disk (#445); its write rate is what an
+ * operator most needs to monitor.
+ *
+ * Argument for including `lp` and `host_fn` here rather than in a second
+ * counter: the counter name "transfers" is admittedly a loose fit for log
+ * rows, but adding a second counter for two values costs readers an extra
+ * query just to get "total rows written".  A `type` label with four fixed
+ * values is cheaper than a second metric, and the help text names all four.
  */
 export const transfersStoredTotal = new Counter({
   name: "transfers_stored_total",
-  help: "Transfer records persisted by the indexer, per network and record type",
+  help: "Rows persisted by the indexer, per network and record type (fungible, nft, lp, host_fn)",
   labelNames: ["network", "type"] as const,
   registers: [registry],
 });
@@ -289,15 +298,24 @@ export const ledgersSkippedTotal = new Counter({
 });
 
 /**
- * Events dropped by the decoder, by reason.
+ * Events dropped by the decoder, by network and reason.
  *
- * `malformed` means a token event that failed to decode; a rising rate points
- * at a contract emitting non-standard events or a decoder bug.
+ * `reason` distinguishes the three drop sites:
+ *  - `malformed`  — a fungible token event whose XDR decoded but produced an
+ *    invalid structure (bad topic count, non-address topic, etc.)
+ *  - `nft_parse`  — an NFT event that `parseNftTransferEvent` returned null for
+ *  - `host_fn`    — a host-function log event that `parseHostFnEvent` threw on
+ *
+ * `unrecognised` events (non-token events filtered out by `parseEvents` before
+ * any decode attempt) are still counted but carry no network label because they
+ * are routine background noise, not errors.  Every other kind carries `network`
+ * so a rising malformed count can be pinned to a chain in a mixed testnet +
+ * mainnet process.
  */
 export const eventsSkippedTotal = new Counter({
   name: "events_skipped_total",
-  help: "Events skipped by the decoder",
-  labelNames: ["reason"] as const,
+  help: "Events dropped during ingest, by network and reason",
+  labelNames: ["network", "reason"] as const,
   registers: [registry],
 });
 
