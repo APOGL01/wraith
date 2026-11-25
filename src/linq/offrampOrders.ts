@@ -45,44 +45,41 @@ export async function reconcileOfframpOrder(
 
   const status = event.status ?? event.event;
 
-  // Early-return when the status is unchanged: a wallet polling a finished
-  // order and a re-delivered webhook must not re-fire money-failure counters,
-  // terminal metrics, or issue unnecessary database writes.
-  // Amounts are only written on a settlement transition (see below), so they
-  // cannot change independently of a status change in normal operation.
-  if (status === existing.status) return true;
-
-  // Counted here rather than in the webhook so the sweep counts it too: either
-  // path may be the one that first sees the ending. Comparing the row we just
-  // read against the incoming status is what keeps a redelivered webhook, and a
-  // wallet polling a finished order, from counting the same ending twice.
   const wasTerminal = terminalStatusOf(existing.status);
   const isTerminal = terminalStatusOf(status);
 
-  // Only write settled amounts on a settlement transition. Writing them on
-  // every status change (e.g. "processing") stores the in-flight amount as the
-  // settled figure, which is wrong for the settled/cache display path.
-  const isSettlement = isTerminal === "settled";
+  // Skip the row update and terminal counter when the status hasn't changed —
+  // a wallet polling a finished order must not re-fire the terminal metric or
+  // issue an unnecessary write. recordMoneyFailure still runs: its upsert
+  // increments occurrences on each sighting, which is what the incident table
+  // exists for (one alarm per failed order, not one per poll).
+  if (status !== existing.status) {
+    // Only write final amounts on a terminal transition. Writing them on an
+    // intermediate status (e.g. "processing") would store an in-flight figure
+    // as the settled amount, which the cache path would then show as final.
+    // "completed" and "settled" both carry final amounts; so do other terminals.
+    const isFinalTransition = isTerminal !== null;
 
-  await prisma.offrampOrder.update({
-    where: { network_orderId: { network, orderId: event.orderId } },
-    data: {
-      status,
-      ...(isSettlement && event.amountStableCoin != null
-        ? { settledStableCoin: String(event.amountStableCoin) }
-        : {}),
-      ...(isSettlement && event.amountNGN != null
-        ? { settledNGN: String(event.amountNGN) }
-        : {}),
-      ...(event.txHash ? { depositTxHash: event.txHash } : {}),
-    },
-  });
+    await prisma.offrampOrder.update({
+      where: { network_orderId: { network, orderId: event.orderId } },
+      data: {
+        status,
+        ...(isFinalTransition && event.amountStableCoin != null
+          ? { settledStableCoin: String(event.amountStableCoin) }
+          : {}),
+        ...(isFinalTransition && event.amountNGN != null
+          ? { settledNGN: String(event.amountNGN) }
+          : {}),
+        ...(event.txHash ? { depositTxHash: event.txHash } : {}),
+      },
+    });
 
-  // An offramp order that ended failed is the incident this table exists for:
-  // the user's crypto was taken and the naira payout did not complete. Every
-  // path — webhook, status poll and the periodic sweep — goes through this
-  // function, and the (network, kind, orderId) key turns several sightings of
-  // one failed order into one incident rather than several alarms.
+    if (isTerminal && !wasTerminal) recordOrderTerminal("offramp", status);
+  }
+
+  // Recorded on every sighting of a failure status, not only the first: the
+  // upsert increments occurrences so each redelivery or poll is counted as a
+  // sighting of the same incident rather than a new one.
   if (isFailureStatus(status)) {
     await recordMoneyFailure({
       network: existing.network,
@@ -95,6 +92,5 @@ export async function reconcileOfframpOrder(
     });
   }
 
-  if (isTerminal && !wasTerminal) recordOrderTerminal("offramp", status);
   return true;
 }

@@ -120,21 +120,23 @@ describe("reconcileOfframpOrder — idempotency on repeated polls", () => {
     expect(mockMoneyFailuresInc).toHaveBeenCalledTimes(1);
     expect(mockUpsert).toHaveBeenCalledTimes(1);
 
-    // Second poll: status is now "failed" in the store. The early-return
-    // must fire because nothing changed.
+    // Second poll: status is now "failed" in the store. The DB row update and
+    // terminal counter must be skipped, but recordMoneyFailure still runs to
+    // increment occurrences — that is what the incident table exists for.
     mockMoneyFailuresInc.mockClear();
     mockUpsert.mockClear();
     mockUpdate.mockClear();
 
     await reconcileOfframpOrder(BASE_EVENT);
 
-    // No counter bump, no upsert, no DB write on the second sighting.
-    expect(mockMoneyFailuresInc).not.toHaveBeenCalled();
-    expect(mockUpsert).not.toHaveBeenCalled();
+    // Row update skipped — no second write to the order row.
     expect(mockUpdate).not.toHaveBeenCalled();
+    // But the failure upsert (occurrences++) still fires.
+    expect(mockMoneyFailuresInc).toHaveBeenCalledTimes(1);
+    expect(mockUpsert).toHaveBeenCalledTimes(1);
   });
 
-  it("returns true on the second (no-op) poll without writing", async () => {
+  it("returns true on the second (no-op) poll without a row update", async () => {
     await reconcileOfframpOrder(BASE_EVENT);
     const result = await reconcileOfframpOrder(BASE_EVENT);
     expect(result).toBe(true);
@@ -201,12 +203,13 @@ describe("reconcileOfframpOrder — settled figures on settlement only", () => {
     expect(written.settledNGN).toBe("82750");
   });
 
-  it("does not write settled amounts on a failed transition", async () => {
+  it("does not write settled amounts on a non-terminal transition", async () => {
+    // "processing" is not terminal — amounts must not be stored.
     await reconcileOfframpOrder({
       orderId: "linq-order-001",
       network: "testnet",
-      event: "failed",
-      status: "failed",
+      event: "processing",
+      status: "processing",
       amountStableCoin: 50,
       amountNGN: 82750,
     });
@@ -219,7 +222,7 @@ describe("reconcileOfframpOrder — settled figures on settlement only", () => {
 });
 
 describe("reconcileOfframpOrder — no-op on unchanged status", () => {
-  it("returns true without writing when status and amounts are unchanged", async () => {
+  it("returns true without a row update when status and amounts are unchanged", async () => {
     store = makeRow({ status: "processing" });
 
     const result = await reconcileOfframpOrder({
@@ -231,6 +234,7 @@ describe("reconcileOfframpOrder — no-op on unchanged status", () => {
 
     expect(result).toBe(true);
     expect(mockUpdate).not.toHaveBeenCalled();
+    // "processing" is not a failure status, so no money-failure counter either.
     expect(mockMoneyFailuresInc).not.toHaveBeenCalled();
   });
 
