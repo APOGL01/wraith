@@ -5,6 +5,7 @@
  */
 import express from "express";
 import request from "supertest";
+import { Keypair } from "@stellar/stellar-sdk";
 
 process.env.LINQ_API_KEY = "test-key";
 
