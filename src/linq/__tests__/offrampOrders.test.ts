@@ -7,14 +7,16 @@
  * reconciliation logic directly.
  *
  * What is covered:
- *   - Polling a failed order twice records exactly one failure (the upsert
- *     increments occurrences rather than inserting a second row; the counter
- *     is only incremented on the first sighting).
+ *   - Polling a failed order twice records exactly one failure — the counter
+ *     and the upsert fire only on the status transition, never on a repeat
+ *     poll of an already-failed row.
  *   - A missing amount (provider omitted the field) leaves settledStableCoin
  *     and settledNGN untouched — no write of the text "undefined".
  *   - Settled figures are only written on a settlement transition, not on
  *     intermediate status changes like "processing".
- *   - An unchanged status returns true without writing.
+ *   - An unchanged status returns true without writing the order row, but
+ *     still applies any extra fields (txHash, settled amounts) the event
+ *     carries.
  */
 
 import type { OfframpOrder } from "@prisma/client";
@@ -120,9 +122,9 @@ describe("reconcileOfframpOrder — idempotency on repeated polls", () => {
     expect(mockMoneyFailuresInc).toHaveBeenCalledTimes(1);
     expect(mockUpsert).toHaveBeenCalledTimes(1);
 
-    // Second poll: status is now "failed" in the store. The DB row update and
-    // terminal counter must be skipped, but recordMoneyFailure still runs to
-    // increment occurrences — that is what the incident table exists for.
+    // Second poll: status is already "failed" in the store. Neither the
+    // counter nor the upsert should fire again — the failure was recorded on
+    // the transition, not on every subsequent sighting.
     mockMoneyFailuresInc.mockClear();
     mockUpsert.mockClear();
     mockUpdate.mockClear();
@@ -131,9 +133,9 @@ describe("reconcileOfframpOrder — idempotency on repeated polls", () => {
 
     // Row update skipped — no second write to the order row.
     expect(mockUpdate).not.toHaveBeenCalled();
-    // But the failure upsert (occurrences++) still fires.
-    expect(mockMoneyFailuresInc).toHaveBeenCalledTimes(1);
-    expect(mockUpsert).toHaveBeenCalledTimes(1);
+    // Counter and upsert must not fire on a repeat poll of an already-failed order.
+    expect(mockMoneyFailuresInc).not.toHaveBeenCalled();
+    expect(mockUpsert).not.toHaveBeenCalled();
   });
 
   it("returns true on the second (no-op) poll without a row update", async () => {
@@ -222,22 +224,6 @@ describe("reconcileOfframpOrder — settled figures on settlement only", () => {
 });
 
 describe("reconcileOfframpOrder — no-op on unchanged status", () => {
-  it("returns true without a row update when status and amounts are unchanged", async () => {
-    store = makeRow({ status: "processing" });
-
-    const result = await reconcileOfframpOrder({
-      orderId: "linq-order-001",
-      network: "testnet",
-      event: "processing",
-      status: "processing",
-    });
-
-    expect(result).toBe(true);
-    expect(mockUpdate).not.toHaveBeenCalled();
-    // "processing" is not a failure status, so no money-failure counter either.
-    expect(mockMoneyFailuresInc).not.toHaveBeenCalled();
-  });
-
   it("does write when the status changes even if amounts are the same", async () => {
     store = makeRow({ status: "initiated" });
 
@@ -249,5 +235,37 @@ describe("reconcileOfframpOrder — no-op on unchanged status", () => {
     });
 
     expect(mockUpdate).toHaveBeenCalledTimes(1);
+  });
+
+  it("writes txHash when the event carries one, even if the status is unchanged", async () => {
+    store = makeRow({ status: "settled", depositTxHash: null });
+
+    await reconcileOfframpOrder({
+      orderId: "linq-order-001",
+      network: "testnet",
+      event: "settled",
+      status: "settled",
+      txHash: "abc123txhash",
+    });
+
+    expect(mockUpdate).toHaveBeenCalledTimes(1);
+    const written = (mockUpdate.mock.calls[0][0] as { data: Row }).data;
+    expect(written.depositTxHash).toBe("abc123txhash");
+    // The money-failure counter must not fire — no status change.
+    expect(mockMoneyFailuresInc).not.toHaveBeenCalled();
+  });
+
+  it("does not write when the status is unchanged and no extra fields are present", async () => {
+    store = makeRow({ status: "processing" });
+
+    const result = await reconcileOfframpOrder({
+      orderId: "linq-order-001",
+      network: "testnet",
+      event: "processing",
+      status: "processing",
+    });
+
+    expect(result).toBe(true);
+    expect(mockUpdate).not.toHaveBeenCalled();
   });
 });

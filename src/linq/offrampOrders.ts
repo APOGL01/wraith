@@ -31,6 +31,11 @@ export interface OfframpReconciliationEvent {
  * Returns true without writing when the status and amounts are unchanged —
  * idempotent so a wallet polling a finished order and a re-delivered webhook
  * never re-fire money-failure counters or terminal metrics.
+ *
+ * Fields that main writes (txHash, settled amounts) are always applied when
+ * present, even when the status has not changed. A poll may settle the row
+ * before a webhook arrives with the transaction hash; dropping those fields
+ * because the status is already terminal would lose data.
  */
 export async function reconcileOfframpOrder(
   event: OfframpReconciliationEvent,
@@ -48,11 +53,6 @@ export async function reconcileOfframpOrder(
   const wasTerminal = terminalStatusOf(existing.status);
   const isTerminal = terminalStatusOf(status);
 
-  // Skip the row update and terminal counter when the status hasn't changed —
-  // a wallet polling a finished order must not re-fire the terminal metric or
-  // issue an unnecessary write. recordMoneyFailure still runs: its upsert
-  // increments occurrences on each sighting, which is what the incident table
-  // exists for (one alarm per failed order, not one per poll).
   if (status !== existing.status) {
     // Only write final amounts on a terminal transition. Writing them on an
     // intermediate status (e.g. "processing") would store an in-flight figure
@@ -75,21 +75,41 @@ export async function reconcileOfframpOrder(
     });
 
     if (isTerminal && !wasTerminal) recordOrderTerminal("offramp", status);
-  }
 
-  // Recorded on every sighting of a failure status, not only the first: the
-  // upsert increments occurrences so each redelivery or poll is counted as a
-  // sighting of the same incident rather than a new one.
-  if (isFailureStatus(status)) {
-    await recordMoneyFailure({
-      network: existing.network,
-      rail: "offramp",
-      kind: "payout_rejected",
-      orderId: event.orderId,
-      publicId: existing.publicId,
-      providerCode: status,
-      message: `Offramp order ended as "${status}" — the naira payout did not complete.`,
-    });
+    // Record a money failure only on the transition into a failure status, not
+    // on every subsequent poll. The counter and incident table must not grow
+    // each time a finished-failed order is re-polled.
+    if (isFailureStatus(status)) {
+      await recordMoneyFailure({
+        network: existing.network,
+        rail: "offramp",
+        kind: "payout_rejected",
+        orderId: event.orderId,
+        publicId: existing.publicId,
+        providerCode: status,
+        message: `Offramp order ended as "${status}" — the naira payout did not complete.`,
+      });
+    }
+  } else {
+    // Status is unchanged. The row update above is skipped, but fields that
+    // main writes — txHash and settled amounts — must still be applied when
+    // the event carries them and the row does not already have them. A webhook
+    // arriving after a poll has already set the terminal status is the common
+    // case for txHash delivery.
+    const extraFields: Record<string, string> = {};
+    if (event.txHash && !existing.depositTxHash)
+      extraFields.depositTxHash = event.txHash;
+    if (isTerminal !== null && event.amountStableCoin != null && existing.settledStableCoin == null)
+      extraFields.settledStableCoin = String(event.amountStableCoin);
+    if (isTerminal !== null && event.amountNGN != null && existing.settledNGN == null)
+      extraFields.settledNGN = String(event.amountNGN);
+
+    if (Object.keys(extraFields).length > 0) {
+      await prisma.offrampOrder.update({
+        where: { network_orderId: { network, orderId: event.orderId } },
+        data: extraFields,
+      });
+    }
   }
 
   return true;
